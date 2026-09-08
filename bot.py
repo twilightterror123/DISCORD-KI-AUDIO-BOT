@@ -6,6 +6,7 @@ import tempfile
 from pathlib import Path
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -18,7 +19,6 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 
 def process_audio(source: Path, output: Path) -> None:
-    """Mastert die Audiodatei lokal mit FFmpeg und erstellt eine MP3."""
     if shutil.which("ffmpeg") is None:
         raise RuntimeError("FFmpeg ist nicht installiert oder nicht im PATH.")
 
@@ -33,61 +33,67 @@ def process_audio(source: Path, output: Path) -> None:
         "loudnorm=I=-14:TP=-1.5:LRA=11"
     )
 
-    command = [
+    result = subprocess.run([
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
         "-i", str(source), "-vn", "-af", filters,
         "-map_metadata", "0", "-codec:a", "libmp3lame", "-b:a", "192k",
         str(output),
-    ]
-    result = subprocess.run(command, capture_output=True, text=True)
+    ], capture_output=True, text=True)
+
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip()[-1500:] or "FFmpeg konnte die Datei nicht verarbeiten.")
     if not output.exists() or output.stat().st_size == 0:
-        raise RuntimeError("FFmpeg hat keine fertige MP3 erzeugt.")
+        raise RuntimeError("Keine fertige MP3 wurde erzeugt.")
+
+
+async def make_mp3(attachment: discord.Attachment) -> discord.File:
+    if attachment.size > MAX_FILE_SIZE:
+        raise RuntimeError("Die Datei ist zu groß. Maximal 25 MB.")
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        source = temp / f"input{Path(attachment.filename).suffix.lower()}"
+        output = temp / "mastered.mp3"
+        await attachment.save(source)
+        await asyncio.to_thread(process_audio, source, output)
+
+        # Discord.File muss vor dem Löschen des temporären Ordners erstellt werden.
+        return discord.File(output, filename="mastered.mp3")
 
 
 @bot.event
 async def on_ready():
     print(f"Eingeloggt als {bot.user}")
-    print("Audio-Bot ist bereit. MP3 hochladen, dann kommt die fertige MP3 zurück.")
+    print("Audio-Bot ist bereit.")
 
 
 @bot.event
-async def on_message(message: discord.Message):
-    if message.author.bot:
+async def setup_hook():
+    synced = await bot.tree.sync()
+    print(f"{len(synced)} Slash-Commands synchronisiert.")
+
+
+@bot.tree.command(name="master", description="Bearbeitet eine Audiodatei und sendet eine fertige MP3 zurück.")
+@app_commands.describe(audio="Die MP3 oder andere Audiodatei")
+async def master(interaction: discord.Interaction, audio: discord.Attachment):
+    suffix = Path(audio.filename).suffix.lower()
+    if suffix not in AUDIO_EXTENSIONS:
+        await interaction.response.send_message(
+            "❌ Unterstützte Formate: MP3, WAV, M4A, FLAC, OGG, AAC und OPUS.",
+            ephemeral=True,
+        )
         return
 
-    audio = next(
-        (a for a in message.attachments
-         if Path(a.filename).suffix.lower() in AUDIO_EXTENSIONS),
-        None,
-    )
-
-    if audio:
-        if audio.size > MAX_FILE_SIZE:
-            await message.reply("❌ Die Datei ist zu groß. Maximal 25 MB.")
-            return
-
-        async with message.channel.typing():
-            try:
-                with tempfile.TemporaryDirectory() as temp_dir:
-                    temp = Path(temp_dir)
-                    suffix = Path(audio.filename).suffix.lower()
-                    source = temp / f"input{suffix}"
-                    output = temp / "mastered.mp3"
-
-                    await audio.save(source)
-                    await asyncio.to_thread(process_audio, source, output)
-
-                    await message.reply(
-                        "✅ Fertig — hier ist deine automatisch bearbeitete MP3:",
-                        file=discord.File(output, filename="mastered.mp3"),
-                    )
-            except Exception as error:
-                print(f"Audio-Fehler: {error}")
-                await message.reply(f"❌ Verarbeitung fehlgeschlagen: `{error}`")
-
-    await bot.process_commands(message)
+    await interaction.response.defer()
+    try:
+        file = await make_mp3(audio)
+        await interaction.followup.send(
+            "✅ Fertig — hier ist deine bearbeitete MP3:",
+            file=file,
+        )
+    except Exception as error:
+        print(f"Audio-Fehler: {error}")
+        await interaction.followup.send(f"❌ Verarbeitung fehlgeschlagen: `{error}`")
 
 
 @bot.command()
