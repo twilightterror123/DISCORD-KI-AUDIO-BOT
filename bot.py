@@ -12,7 +12,6 @@ from discord.ext import commands
 TOKEN = os.getenv("DISCORD_TOKEN")
 MAX_FILE_SIZE = 25 * 1024 * 1024
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".aac", ".opus"}
-
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -26,49 +25,15 @@ def run_ffmpeg(args):
         raise RuntimeError(result.stderr.strip()[-1500:] or "FFmpeg-Fehler")
 
 
-def process_master(source: Path, output: Path) -> None:
-    filters = (
-        "highpass=f=28,lowpass=f=19500,"
-        "equalizer=f=55:t=q:w=0.9:g=4.5,"
-        "equalizer=f=85:t=q:w=0.8:g=5.5,"
-        "equalizer=f=150:t=q:w=1:g=2.5,"
-        "equalizer=f=280:t=q:w=1:g=-3,"
-        "equalizer=f=2500:t=q:w=1:g=2.5,"
-        "equalizer=f=8500:t=q:w=0.8:g=3,"
-        "acompressor=threshold=-24dB:ratio=4:attack=8:release=100:makeup=3,"
-        "aecho=0.8:0.7:650:0.22,"
-        "stereotools=mlev=1.12,"
-        "alimiter=limit=0.96:attack=5:release=60,"
-        "loudnorm=I=-11:TP=-1.0:LRA=7"
-    )
-    run_ffmpeg(["-i", str(source), "-vn", "-af", filters, "-map_metadata", "0", "-codec:a", "libmp3lame", "-b:a", "256k", str(output)])
+def process_audio(source, output, remix=False, second=None):
+    filters = ("highpass=f=28,lowpass=f=19500,equalizer=f=60:t=q:w=0.8:g=5,equalizer=f=95:t=q:w=0.8:g=5,equalizer=f=180:t=q:w=1:g=2,equalizer=f=300:t=q:w=1:g=-3,equalizer=f=3000:t=q:w=1:g=2.5,equalizer=f=9000:t=q:w=0.8:g=3,acompressor=threshold=-25dB:ratio=4.5:attack=7:release=110:makeup=4,aecho=0.85:0.75:700:0.28,stereotools=mlev=1.15,alimiter=limit=0.95:attack=5:release=60,loudnorm=I=-11:TP=-1.0:LRA=7")
+    if remix:
+        args = ["-i", str(source), "-i", str(second), "-filter_complex", f"[0:a][1:a]amix=inputs=2:duration=longest:dropout_transition=3,{filters}[a]", "-map", "[a]"]
+    else:
+        args = ["-i", str(source), "-vn", "-af", filters, "-map_metadata", "0"]
+    run_ffmpeg(args + ["-codec:a", "libmp3lame", "-b:a", "256k", str(output)])
     if not output.exists() or output.stat().st_size == 0:
         raise RuntimeError("Keine fertige MP3 wurde erzeugt.")
-
-
-def process_remix(first: Path, second: Path, output: Path) -> None:
-    # Zwei Tracks werden rhythmisch gemischt, mit starkem Bass, Reverb und Mastering.
-    filters = (
-        "highpass=f=28,lowpass=f=19500,"
-        "equalizer=f=60:t=q:w=0.8:g=5,"
-        "equalizer=f=95:t=q:w=0.8:g=5,"
-        "equalizer=f=180:t=q:w=1:g=2,"
-        "equalizer=f=300:t=q:w=1:g=-3,"
-        "equalizer=f=3000:t=q:w=1:g=2.5,"
-        "equalizer=f=9000:t=q:w=0.8:g=3,"
-        "acompressor=threshold=-25dB:ratio=4.5:attack=7:release=110:makeup=4,"
-        "aecho=0.85:0.75:700:0.28,"
-        "stereotools=mlev=1.15,"
-        "alimiter=limit=0.95:attack=5:release=60,"
-        "loudnorm=I=-11:TP=-1.0:LRA=7"
-    )
-    run_ffmpeg([
-        "-i", str(first), "-i", str(second),
-        "-filter_complex", f"[0:a][1:a]amix=inputs=2:duration=longest:dropout_transition=3,{filters}[a]",
-        "-map", "[a]", "-codec:a", "libmp3lame", "-b:a", "256k", str(output),
-    ])
-    if not output.exists() or output.stat().st_size == 0:
-        raise RuntimeError("Kein Remix wurde erzeugt.")
 
 
 async def save_attachment(attachment, path):
@@ -91,22 +56,22 @@ async def setup_hook():
     print(f"{len(synced)} Slash-Commands synchronisiert.")
 
 
-@bot.tree.command(name="master", description="Starker Bass, klarer Sound, hörbarer Reverb und lautes Mastering")
+@bot.tree.command(name="master", description="Starker Bass, klarer Sound und hörbarer Reverb")
 @app_commands.describe(audio="Eine Audiodatei")
 async def master(interaction: discord.Interaction, audio: discord.Attachment):
     await interaction.response.defer()
     try:
         with tempfile.TemporaryDirectory() as folder:
-            source = Path(folder) / "input" + Path(audio.filename).suffix
+            source = Path(folder) / ("input" + Path(audio.filename).suffix.lower())
             output = Path(folder) / "mastered.mp3"
             await save_attachment(audio, source)
-            await asyncio.to_thread(process_master, source, output)
+            await asyncio.to_thread(process_audio, source, output)
             await interaction.followup.send("✅ Fertig: fetter Bass, klarer Sound und hörbarer Reverb.", file=discord.File(output, "mastered.mp3"))
     except Exception as error:
         await interaction.followup.send(f"❌ Fehler: `{error}`")
 
 
-@bot.tree.command(name="remix", description="Mischt zwei Audiodateien zu einem Bass-Remix")
+@bot.tree.command(name="remix", description="Mischt zwei Songs zu einem Bass-Remix")
 @app_commands.describe(first="Erster Song", second="Zweiter Song")
 async def remix(interaction: discord.Interaction, first: discord.Attachment, second: discord.Attachment):
     await interaction.response.defer()
@@ -118,7 +83,7 @@ async def remix(interaction: discord.Interaction, first: discord.Attachment, sec
             output = folder / "remix.mp3"
             await save_attachment(first, first_path)
             await save_attachment(second, second_path)
-            await asyncio.to_thread(process_remix, first_path, second_path, output)
+            await asyncio.to_thread(process_audio, first_path, output, True, second_path)
             await interaction.followup.send("🔥 Remix fertig — zwei Songs, fetter Bass und hörbarer Reverb.", file=discord.File(output, "remix.mp3"))
     except Exception as error:
         await interaction.followup.send(f"❌ Fehler: `{error}`")
@@ -131,5 +96,4 @@ async def ping(ctx):
 
 if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN fehlt als Umgebungsvariable.")
-
 bot.run(TOKEN)
