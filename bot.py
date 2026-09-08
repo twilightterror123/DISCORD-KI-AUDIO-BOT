@@ -28,15 +28,28 @@ bot = AudioBot(command_prefix="!", intents=intents)
 
 def run_ffmpeg(args, allow_error=False):
     if shutil.which("ffmpeg") is None:
-        raise RuntimeError("FFmpeg ist nicht installiert oder nicht im PATH.")
+        raise RuntimeError("FFmpeg ist nicht installiert. Installiere es mit: sudo apt install ffmpeg")
     result = subprocess.run(
         ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *args],
         capture_output=True,
         text=True,
     )
     if result.returncode != 0 and not allow_error:
-        raise RuntimeError(result.stderr.strip()[-1500:] or "FFmpeg-Fehler")
+        raise RuntimeError(result.stderr.strip()[-1800:] or "FFmpeg-Fehler")
     return result
+
+
+def probe_duration(source):
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", str(source),
+        ], capture_output=True, text=True,
+    )
+    try:
+        return max(1.0, float(result.stdout.strip()))
+    except ValueError:
+        return 180.0
 
 
 def detect_peak(source):
@@ -53,88 +66,107 @@ def detect_peak(source):
     return -12.0
 
 
-def adaptive_master_filters(peak=-12.0):
-    # Keine pauschale Bass-Übertreibung: bereits laute Songs werden sanfter behandelt.
-    if peak > -3:
-        bass, treble, ratio = 0.5, 0.5, 1.5
-    elif peak > -8:
-        bass, treble, ratio = 1.2, 1.0, 1.8
-    else:
-        bass, treble, ratio = 2.0, 1.5, 2.2
+def bass_gain(value):
+    return {"wenig": -1.0, "mittel": 1.5, "viel": 4.0}[value]
 
+
+def loudness_target(value):
+    return {"leise": -18, "normal": -14, "laut": -10}[value]
+
+
+def master_filter(bass="mittel", loudness="normal", vocal="klar"):
+    bass_db = bass_gain(bass)
+    target = loudness_target(loudness)
+    vocal_db = 1.8 if vocal == "klar" else 0.0
     return (
-        "highpass=f=28,"
-        "lowpass=f=19000,"
-        f"equalizer=f=55:t=q:w=0.8:g={bass},"
-        f"equalizer=f=95:t=q:w=0.9:g={bass},"
-        "equalizer=f=250:t=q:w=1:g=-1.8,"
-        "equalizer=f=700:t=q:w=1:g=-1,"
-        "equalizer=f=2200:t=q:w=1:g=1.2,"
-        "equalizer=f=4500:t=q:w=1:g=1.4,"
-        f"equalizer=f=10000:t=q:w=0.8:g={treble},"
-        f"acompressor=threshold=-24dB:ratio={ratio}:attack=20:release=160:makeup=1,"
-        "acrusher=bits=16:mix=0.012,"
-        "aecho=0.82:0.12:380:0.045,"
-        "chorus=0.25:0.6:32:0.12:0.08:2,"
-        "stereotools=mlev=1.025:slev=1.02,"
+        "highpass=f=28,lowpass=f=19500,"
+        f"equalizer=f=55:t=q:w=0.8:g={bass_db},"
+        "equalizer=f=110:t=q:w=0.9:g=1.0,"
+        "equalizer=f=250:t=q:w=1:g=-2.0,"
+        "equalizer=f=650:t=q:w=1:g=-1.0,"
+        f"equalizer=f=2500:t=q:w=1:g={vocal_db},"
+        "equalizer=f=5000:t=q:w=1:g=1.2,"
+        "equalizer=f=10500:t=q:w=0.8:g=1.0,"
+        "acompressor=threshold=-24dB:ratio=2.2:attack=18:release=160:makeup=1,"
+        "stereotools=mlev=1.02:slev=1.02,"
         "alimiter=limit=0.96:attack=5:release=90,"
-        "loudnorm=I=-14:TP=-1.2:LRA=8"
+        f"loudnorm=I={target}:TP=-1.2:LRA=9"
     )
 
 
-def remix_filters(peak_a, peak_b):
-    # Beide Songs werden auf ein ähnliches Niveau gebracht, bevor sie gemischt werden.
-    # So wird ein Song nicht vom anderen überfahren.
-    target_a = max(-18.0, min(-8.0, peak_a - 1.0))
-    target_b = max(-18.0, min(-8.0, peak_b - 1.0))
-    master = adaptive_master_filters(min(peak_a, peak_b))
-    return (
-        f"[0:a]aformat=sample_fmts=fltp,aresample=48000,loudnorm=I={target_a}:TP=-2:LRA=11[a0];"
-        f"[1:a]aformat=sample_fmts=fltp,aresample=48000,loudnorm=I={target_b}:TP=-2:LRA=11[a1];"
-        "[a0][a1]amix=inputs=2:duration=longest:dropout_transition=5:weights=1 1:normalize=1,"
-        "highpass=f=30,"
-        "lowpass=f=19000,"
-        "equalizer=f=60:t=q:w=0.8:g=1.5,"
-        "equalizer=f=250:t=q:w=1:g=-2,"
-        "equalizer=f=2500:t=q:w=1:g=1,"
-        "equalizer=f=9000:t=q:w=0.8:g=1,"
-        "acompressor=threshold=-23dB:ratio=2:attack=25:release=180:makeup=1,"
-        "acrusher=bits=16:mix=0.01,"
-        "aecho=0.82:0.1:420:0.04,"
-        "chorus=0.2:0.55:30:0.1:0.06:2,"
-        "stereotools=mlev=1.025:slev=1.02,"
-        "alimiter=limit=0.96:attack=5:release=90,"
-        "loudnorm=I=-14:TP=-1.2:LRA=8[remix]"
-    )
+def render_master(source, output, bass, loudness, vocal):
+    run_ffmpeg([
+        "-i", str(source), "-vn", "-af", master_filter(bass, loudness, vocal),
+        "-map_metadata", "0", "-codec:a", "libmp3lame", "-b:a", "320k", str(output),
+    ])
 
 
-def process_audio(source, output, remix=False, second=None):
-    peak_a = detect_peak(source)
-    if remix:
-        peak_b = detect_peak(second)
-        args = [
-            "-i", str(source), "-i", str(second),
-            "-filter_complex", remix_filters(peak_a, peak_b),
-            "-map", "[remix]",
-        ]
+def render_remix(first, second, output, bass, loudness, mode):
+    duration_a = probe_duration(first)
+    duration_b = probe_duration(second)
+    target = loudness_target(loudness)
+    bass_db = bass_gain(bass)
+
+    # Struktur statt stumpfem Vollsong-Overlay:
+    # intro A -> Übergang A/B -> Hauptteil B -> kurzer gemeinsamer Outro-Mix.
+    if mode == "mashup":
+        a_end = min(35.0, duration_a * 0.28)
+        b_start = min(20.0, max(0.0, duration_b * 0.08))
+        b_end = min(duration_b, b_start + max(45.0, duration_a * 0.45))
+        fade = 5.0
+        filter_complex = (
+            f"[0:a]atrim=start=0:end={a_end},asetpts=PTS-STARTPTS,"
+            f"loudnorm=I={target}:TP=-2:LRA=11[a];"
+            f"[1:a]atrim=start={b_start}:end={b_end},asetpts=PTS-STARTPTS,"
+            f"loudnorm=I={target}:TP=-2:LRA=11[b];"
+            f"[a][b]acrossfade=d={fade}:c1=tri:c2=tri,"
+            f"{master_filter(bass, loudness, 'klar')}[out]"
+        )
+    elif mode == "transition":
+        a_end = min(60.0, duration_a)
+        b_start = min(30.0, duration_b * 0.15)
+        b_end = min(duration_b, b_start + 90.0)
+        filter_complex = (
+            f"[0:a]atrim=0:{a_end},asetpts=PTS-STARTPTS,"
+            f"loudnorm=I={target}:TP=-2:LRA=11[a];"
+            f"[1:a]atrim={b_start}:{b_end},asetpts=PTS-STARTPTS,"
+            f"loudnorm=I={target}:TP=-2:LRA=11[b];"
+            "[a][b]acrossfade=d=8:c1=exp:c2=exp,"
+            f"{master_filter(bass, loudness, 'klar')}[out]"
+        )
     else:
-        args = [
-            "-i", str(source),
-            "-vn",
-            "-af", adaptive_master_filters(peak_a),
-            "-map_metadata", "0",
-        ]
-    run_ffmpeg(args + ["-codec:a", "libmp3lame", "-b:a", "320k", str(output)])
-    if not output.exists() or output.stat().st_size == 0:
-        raise RuntimeError("Keine fertige MP3 wurde erzeugt.")
+        # Beat mode: rhythmisch wirkender, kurzer Wechsel mit Sidechain-artiger Ducking-Kurve.
+        a_end = min(32.0, duration_a)
+        b_start = min(16.0, duration_b * 0.1)
+        b_end = min(duration_b, b_start + 64.0)
+        filter_complex = (
+            f"[0:a]atrim=0:{a_end},asetpts=PTS-STARTPTS,"
+            f"loudnorm=I={target}:TP=-2:LRA=11[a];"
+            f"[1:a]atrim={b_start}:{b_end},asetpts=PTS-STARTPTS,"
+            f"loudnorm=I={target}:TP=-2:LRA=11[b];"
+            "[a]volume='if(lt(mod(t,4),0.5),0.55,1)':eval=frame[ad];"
+            "[b]volume='if(lt(mod(t,4),0.5),1,0.72)':eval=frame[bd];"
+            "[ad][bd]amix=inputs=2:duration=longest:dropout_transition=2:normalize=1,"
+            f"{master_filter(bass, loudness, 'klar')}[out]"
+        )
+
+    run_ffmpeg([
+        "-i", str(first), "-i", str(second),
+        "-filter_complex", filter_complex, "-map", "[out]",
+        "-codec:a", "libmp3lame", "-b:a", "320k", str(output),
+    ])
 
 
 async def save_attachment(attachment, path):
     if attachment.size > MAX_FILE_SIZE:
-        raise RuntimeError("Eine Datei ist zu groß. Maximal 25 MB pro Datei.")
+        raise RuntimeError("Maximal 25 MB pro Datei.")
     if Path(attachment.filename).suffix.lower() not in AUDIO_EXTENSIONS:
-        raise RuntimeError("Nur MP3, WAV, M4A, FLAC, OGG, AAC und OPUS werden unterstützt.")
+        raise RuntimeError("Erlaubt: MP3, WAV, M4A, FLAC, OGG, AAC und OPUS.")
     await attachment.save(path)
+
+
+def choices(values):
+    return [app_commands.Choice(name=value.capitalize(), value=value) for value in values]
 
 
 @bot.event
@@ -143,27 +175,38 @@ async def on_ready():
     print("Audio-Bot ist bereit.")
 
 
-@bot.tree.command(name="master", description="Automatisches Mastering für den ganzen Song")
-@app_commands.describe(audio="Eine Audiodatei")
-async def master(interaction: discord.Interaction, audio: discord.Attachment):
+@bot.tree.command(name="master", description="Song sauber mastern mit Bass-, Lautstärke- und Vocal-Auswahl")
+@app_commands.describe(audio="Eine Audiodatei", bass="Bass-Stärke", lautstaerke="Ausgabe-Lautstärke", vocals="Vocal-Klang")
+@app_commands.choices(
+    bass=choices(["wenig", "mittel", "viel"]),
+    lautstaerke=choices(["leise", "normal", "laut"]),
+    vocals=choices(["klar", "neutral"]),
+)
+async def master(interaction: discord.Interaction, audio: discord.Attachment, bass: app_commands.Choice[str], lautstaerke: app_commands.Choice[str], vocals: app_commands.Choice[str]):
     await interaction.response.defer()
     try:
         with tempfile.TemporaryDirectory() as folder:
-            source = Path(folder) / ("input" + Path(audio.filename).suffix.lower())
-            output = Path(folder) / "mastered.mp3"
+            folder = Path(folder)
+            source = folder / ("input" + Path(audio.filename).suffix.lower())
+            output = folder / "mastered.mp3"
             await save_attachment(audio, source)
-            await asyncio.to_thread(process_audio, source, output)
+            await asyncio.to_thread(render_master, source, output, bass.value, lautstaerke.value, vocals.value)
             await interaction.followup.send(
-                "✅ Ganzer Song gemastert: automatisch an Lautheit und Dynamik angepasst.",
+                f"✅ Master fertig | Bass: {bass.name} | Lautstärke: {lautstaerke.name} | Vocals: {vocals.name}",
                 file=discord.File(output, "mastered.mp3"),
             )
     except Exception as error:
         await interaction.followup.send(f"❌ Fehler: `{error}`")
 
 
-@bot.tree.command(name="remix", description="Zwei Songs sinnvoll ausbalancieren und gemeinsam mastern")
-@app_commands.describe(first="Erster Song", second="Zweiter Song")
-async def remix(interaction: discord.Interaction, first: discord.Attachment, second: discord.Attachment):
+@bot.tree.command(name="remix", description="Erzeugt einen strukturierten Remix statt beide Songs stumpf zu stapeln")
+@app_commands.describe(first="Song 1", second="Song 2", bass="Bass-Stärke", lautstaerke="Ausgabe-Lautstärke", modus="Remix-Modus")
+@app_commands.choices(
+    bass=choices(["wenig", "mittel", "viel"]),
+    lautstaerke=choices(["leise", "normal", "laut"]),
+    modus=choices(["mashup", "transition", "beat"]),
+)
+async def remix(interaction: discord.Interaction, first: discord.Attachment, second: discord.Attachment, bass: app_commands.Choice[str], lautstaerke: app_commands.Choice[str], modus: app_commands.Choice[str]):
     await interaction.response.defer()
     try:
         with tempfile.TemporaryDirectory() as folder:
@@ -173,9 +216,9 @@ async def remix(interaction: discord.Interaction, first: discord.Attachment, sec
             output = folder / "remix.mp3"
             await save_attachment(first, first_path)
             await save_attachment(second, second_path)
-            await asyncio.to_thread(process_audio, first_path, output, True, second_path)
+            await asyncio.to_thread(render_remix, first_path, second_path, output, bass.value, lautstaerke.value, modus.value)
             await interaction.followup.send(
-                "🔥 Remix fertig: beide Songs zuerst ausbalanciert, danach gemeinsam gemastert.",
+                f"🔥 Remix fertig | Modus: {modus.name} | Bass: {bass.name} | Lautstärke: {lautstaerke.name}",
                 file=discord.File(output, "remix.mp3"),
             )
     except Exception as error:
