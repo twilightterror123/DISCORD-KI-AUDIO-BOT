@@ -13,32 +13,47 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 MAX_FILE_SIZE = 25 * 1024 * 1024
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".aac", ".opus"}
 
+
+class AudioBot(commands.Bot):
+    async def setup_hook(self):
+        synced = await self.tree.sync()
+        print(f"{len(synced)} Slash-Commands synchronisiert.")
+
+
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = AudioBot(command_prefix="!", intents=intents)
 
 
 def process_audio(source: Path, output: Path) -> None:
     if shutil.which("ffmpeg") is None:
         raise RuntimeError("FFmpeg ist nicht installiert oder nicht im PATH.")
 
+    # Deutlich hörbarer Beat-Boost: Kick/Bass und Präsenz werden angehoben,
+    # Matsch reduziert, anschließend wird sauber komprimiert und begrenzt.
     filters = (
-        "highpass=f=25,lowpass=f=19000,"
-        "equalizer=f=90:t=q:w=1:g=2,"
-        "equalizer=f=250:t=q:w=1:g=-1.5,"
-        "equalizer=f=3500:t=q:w=1:g=1.2,"
-        "acompressor=threshold=-18dB:ratio=2.2:attack=15:release=120:makeup=1,"
-        "stereotools=mlev=0.9,"
-        "alimiter=limit=0.95:attack=5:release=50,"
-        "loudnorm=I=-14:TP=-1.5:LRA=11"
+        "highpass=f=28,lowpass=f=19500,"
+        "equalizer=f=75:t=q:w=0.9:g=5,"
+        "equalizer=f=160:t=q:w=1:g=2,"
+        "equalizer=f=280:t=q:w=1:g=-3,"
+        "equalizer=f=2500:t=q:w=1:g=2.5,"
+        "equalizer=f=9000:t=q:w=0.8:g=3,"
+        "acompressor=threshold=-24dB:ratio=4:attack=8:release=100:makeup=3,"
+        "stereotools=mlev=0.95,"
+        "alimiter=limit=0.97:attack=5:release=50,"
+        "loudnorm=I=-11:TP=-1.0:LRA=7"
     )
 
-    result = subprocess.run([
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-        "-i", str(source), "-vn", "-af", filters,
-        "-map_metadata", "0", "-codec:a", "libmp3lame", "-b:a", "192k",
-        str(output),
-    ], capture_output=True, text=True)
+    result = subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-i", str(source), "-vn", "-af", filters,
+            "-map_metadata", "0", "-codec:a", "libmp3lame", "-b:a", "192k",
+            str(output),
+        ],
+        capture_output=True,
+        text=True,
+    )
 
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip()[-1500:] or "FFmpeg konnte die Datei nicht verarbeiten.")
@@ -56,8 +71,6 @@ async def make_mp3(attachment: discord.Attachment) -> discord.File:
         output = temp / "mastered.mp3"
         await attachment.save(source)
         await asyncio.to_thread(process_audio, source, output)
-
-        # Discord.File muss vor dem Löschen des temporären Ordners erstellt werden.
         return discord.File(output, filename="mastered.mp3")
 
 
@@ -65,12 +78,6 @@ async def make_mp3(attachment: discord.Attachment) -> discord.File:
 async def on_ready():
     print(f"Eingeloggt als {bot.user}")
     print("Audio-Bot ist bereit.")
-
-
-@bot.event
-async def setup_hook():
-    synced = await bot.tree.sync()
-    print(f"{len(synced)} Slash-Commands synchronisiert.")
 
 
 @bot.tree.command(name="master", description="Bearbeitet eine Audiodatei und sendet eine fertige MP3 zurück.")
@@ -88,7 +95,7 @@ async def master(interaction: discord.Interaction, audio: discord.Attachment):
     try:
         file = await make_mp3(audio)
         await interaction.followup.send(
-            "✅ Fertig — hier ist deine bearbeitete MP3:",
+            "✅ Fertig — Beat wurde verstärkt und die MP3 gemastert:",
             file=file,
         )
     except Exception as error:
